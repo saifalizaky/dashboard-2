@@ -8,8 +8,6 @@ import io
 import re
 import textwrap
 from typing import Optional, Tuple
-from pathlib import Path
-import os
 
 import numpy as np
 import pandas as pd
@@ -206,8 +204,7 @@ with st.sidebar:
     )
     st.markdown("---")
     st.subheader("📁 Sumber Data")
-    # Tambah opsi CSV lokal otomatis, opsi lain tetap ada (tidak dihapus)
-    data_mode = st.radio("Mode input", ["CSV Lokal (otomatis)", "Upload CSV", "Paste CSV", "Input Manual (Editor)"], index=0)
+    data_mode = st.radio("Mode input", ["Upload CSV", "Paste CSV", "Input Manual (Editor)"], index=0)
 
     uploaded = None
     pasted_text = None
@@ -226,42 +223,15 @@ if "manual_df" not in st.session_state:
 # =========================
 # Load data
 # =========================
-# Konfigurasi CSV lokal (otomatis)
-DATA_SRC = "data_cleaned_ver2(1).csv"  # ganti sesuai nama file kamu
-BASE_DIR = Path(__file__).resolve().parent
-CSV_PATH = BASE_DIR / DATA_SRC
-
-@st.cache_data(show_spinner=False)
-def load_csv_local(path: Path) -> pd.DataFrame:
-    # Deteksi delimiter & encoding paling umum
-    try:
-        return pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
-    except Exception:
-        return pd.read_csv(path, sep=None, engine="python", encoding="latin-1")
-
 df = None
-if data_mode == "CSV Lokal (otomatis)":
-    try:
-        df = load_csv_local(CSV_PATH)
-    except FileNotFoundError:
-        st.error(f"File tidak ditemukan: {CSV_PATH}\nWorking dir: {os.getcwd()}")
-        csvs = [p.name for p in BASE_DIR.glob("*.csv")]
-        st.info(f"CSV terdeteksi di folder app: {csvs}")
-        st.stop()
-    except Exception as e:
-        st.error(f"Gagal membaca CSV lokal: {e}")
-        st.stop()
-
-elif data_mode == "Upload CSV" and uploaded is not None:
+if data_mode == "Upload CSV" and uploaded is not None:
     df = pd.read_csv(uploaded)
-
 elif data_mode == "Paste CSV" and pasted_text and 'parse' in locals() and parse:
     try:
         df = read_csv_textarea(pasted_text)
         st.sidebar.success("CSV berhasil dibaca.")
     except Exception as e:
         st.sidebar.error(f"Gagal parse CSV: {e}")
-
 elif data_mode == "Input Manual (Editor)":
     st.markdown("### ✍️ Input Data Manual")
     st.caption("Minimal butuh dua kolom: **Fakultas_norm** dan **program studi_clean** (boleh nama lain—app akan deteksi).")
@@ -276,7 +246,7 @@ elif data_mode == "Input Manual (Editor)":
         df = edited.copy()
 
 if df is None or df.empty:
-    st.info("Belum ada data. Gunakan CSV lokal (default) atau unggah/paste CSV di sidebar, atau isi lewat editor manual.")
+    st.info("Belum ada data. Unggah / Paste CSV di sidebar, atau isi lewat editor manual.")
     st.stop()
 
 # =========================
@@ -545,11 +515,14 @@ if page == "📊 Beranda":
                 km = KMeans(n_clusters=k, n_init=10, random_state=42)
                 agg_df["cluster"] = km.fit_predict(Xs)
             except Exception:
-                labels = list(range(k))
-                agg_df["cluster"] = pd.qcut(
-                    agg_df["avg_biaya"].rank(method="first"),
-                    q=k, labels=labels, duplicates="drop"
-                ).astype(int)
+                # SAFE fallback tanpa mismatch labels saat qcut melakukan 'duplicates=drop'
+                rank_vals = agg_df["avg_biaya"].rank(method="first")
+                q_eff = min(k, rank_vals.nunique())
+                if q_eff < 2:
+                    agg_df["cluster"] = 0
+                else:
+                    cuts = pd.qcut(rank_vals, q=q_eff, duplicates="drop")
+                    agg_df["cluster"] = pd.factorize(cuts)[0]  # 0..q_eff-1
 
             agg_df["label"] = agg_df["kelompok"]
 
@@ -604,14 +577,30 @@ if page == "📊 Beranda":
         d_imp = filtered[[x_expo, y_out] + ([color_by] if color_by else [])].dropna()
         if not d_imp.empty:
             lr = try_scipy_linregress(d_imp[x_expo], d_imp[y_out])
-            bins = pd.qcut(d_imp[x_expo], 4, labels=["Q1 (rendah)","Q2","Q3","Q4 (tinggi)"], duplicates="drop")
-            d_lift = d_imp.copy(); d_lift["quartile"] = bins
-            try:
-                q4 = d_lift.loc[d_lift["quartile"]=="Q4 (tinggi)", y_out].mean()
-                q1 = d_lift.loc[d_lift["quartile"]=="Q1 (rendah)", y_out].mean()
-                lift = q4 - q1
-            except Exception:
-                lift = np.nan
+
+            # ---------- SAFE QUARTILING (hindari ValueError labels vs edges) ----------
+            vals = pd.to_numeric(d_imp[x_expo], errors="coerce")
+            nuniq = vals.nunique(dropna=True)
+            labels_map = {
+                2: ["Q1 (rendah)", "Q2 (tinggi)"],
+                3: ["Q1 (rendah)", "Q2", "Q3 (tinggi)"],
+                4: ["Q1 (rendah)", "Q2", "Q3", "Q4 (tinggi)"],
+            }
+            q_eff = min(4, nuniq)  # kuartil efektif 2..4 sesuai variasi data
+
+            d_lift = d_imp.copy()
+            lift = np.nan
+            if q_eff >= 2:
+                bins = pd.qcut(vals.rank(method="first"), q=q_eff, labels=labels_map[q_eff], duplicates="drop")
+                d_lift["quartile"] = bins
+                low_label  = labels_map[q_eff][0]
+                high_label = labels_map[q_eff][-1]
+                q_high = d_lift.loc[d_lift["quartile"] == high_label, y_out].mean()
+                q_low  = d_lift.loc[d_lift["quartile"] == low_label,  y_out].mean()
+                lift = q_high - q_low
+            else:
+                d_lift["quartile"] = np.nan
+            # -------------------------------------------------------------------------
 
             k1,k2,k3,k4 = st.columns(4)
             with k1: st.metric("Slope (β₁)", safe_fmt(lr["slope"], "{:.3f}"))
@@ -627,20 +616,34 @@ if page == "📊 Beranda":
                 st.plotly_chart(fig_sc, use_container_width=True)
             with R:
                 nb = st.slider("Jumlah bin (rata-rata per bin X)", 5, 20, 10, key="bins_home")
-                d_bins = d_imp.copy(); d_bins["bin"] = pd.qcut(d_bins[x_expo], nb, duplicates="drop")
-                if d_bins["bin"].notna().sum() >= nb:
-                    agg = d_bins.groupby("bin").agg(x_mid=(x_expo,"mean"), y_mean=(y_out,"mean"), n=("bin","size")).reset_index()
-                    fig_bin = px.line(agg, x="x_mid", y="y_mean", markers=True, text="n",
-                                      title=f"Rata-rata {y_out} per bin {x_expo}")
-                    fig_bin.update_traces(textposition="top center")
-                    fig_bin.update_layout(modebar_add=["toImage"], xaxis_title=x_expo, yaxis_title=y_out)
-                    st.plotly_chart(fig_bin, use_container_width=True)
+
+                # ---------- Guard untuk BIN MEANS ----------
+                d_bins = d_imp.copy()
+                if d_bins[x_expo].nunique(dropna=True) < 2:
+                    st.info("Variabel X belum cukup bervariasi untuk dibagi menjadi beberapa bin.")
+                else:
+                    nb_eff = min(nb, d_bins[x_expo].nunique(dropna=True))
+                    d_bins["bin"] = pd.qcut(
+                        pd.to_numeric(d_bins[x_expo], errors="coerce").rank(method="first"),
+                        nb_eff,
+                        duplicates="drop"
+                    )
+                    if d_bins["bin"].notna().sum() >= nb_eff:
+                        agg = (d_bins.groupby("bin")
+                                     .agg(x_mid=(x_expo,"mean"), y_mean=(y_out,"mean"), n=("bin","size"))
+                                     .reset_index())
+                        fig_bin = px.line(agg, x="x_mid", y="y_mean", markers=True, text="n",
+                                          title=f"Rata-rata {y_out} per bin {x_expo}")
+                        fig_bin.update_traces(textposition="top center")
+                        fig_bin.update_layout(modebar_add=["toImage"], xaxis_title=x_expo, yaxis_title=y_out)
+                        st.plotly_chart(fig_bin, use_container_width=True)
+                # ------------------------------------------
 
             st.markdown("#### 📝 Interpretasi Otomatis")
             st.write(interpret_text(lr["pvalue"], lr["rvalue"], lr["slope"], lift, x_expo, y_out))
 
     st.markdown("### 🔥 Matriks Korelasi (Ringkas)")
-    if not num_only.empty and num_only.shape[1] >= 2:
+    if not num_only.empty and not num_only.corr(numeric_only=True).empty:
         fig = px.imshow(num_only.corr(numeric_only=True), text_auto=True, aspect="auto",
                         color_continuous_scale="RdBu_r", origin="lower", title="Matriks Korelasi")
         fig.update_layout(modebar_add=["toImage"])
