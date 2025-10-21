@@ -4,10 +4,9 @@
 # Fokus: "Pengaruh Teknologi dalam Proses Belajar Mahasiswa"
 # ---------------------------------------------------------
 
-import os
+import io
 import re
 import textwrap
-from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
@@ -99,6 +98,10 @@ def clean_cat(s: pd.Series) -> pd.Series:
     z = z.replace(mapping)
     return z
 
+@st.cache_data(show_spinner=False)
+def read_csv_textarea(text: str) -> pd.DataFrame:
+    return pd.read_csv(io.StringIO(text))
+
 def try_scipy_pearsonr(x: pd.Series, y: pd.Series) -> Tuple[float, Optional[float]]:
     x = pd.to_numeric(x, errors="coerce")
     y = pd.to_numeric(y, errors="coerce")
@@ -181,67 +184,8 @@ def interpret_bubble(agg_df: pd.DataFrame, level: str, agg_name: str) -> str:
         f"({int(big_row['count'])} orang). Rentang ≈ **{fmt_money(rng)}**; CV ≈ **{safe_fmt(cv,'{:.2f}')}**."
     )
 
-def flag_outliers(df_in, x, y, method="IQR", z=3.0):
-    df = df_in.copy()
-    if df.empty: return pd.Series(False, index=df.index)
-    if method.upper() == "IQR":
-        xq1, xq3 = np.percentile(df[x], [25, 75])
-        yq1, yq3 = np.percentile(df[y], [25, 75])
-        xi, yi = (xq3 - xq1), (yq3 - yq1)
-        xlow, xhigh = xq1 - 1.5 * xi, xq3 + 1.5 * xi
-        ylow, yhigh = yq1 - 1.5 * yi, yq3 + 1.5 * yi
-        return (df[x] < xlow) | (df[x] > xhigh) | (df[y] < ylow) | (df[y] > yhigh)
-    else:
-        zx = (df[x] - df[x].mean()) / (df[x].std(ddof=0) or 1)
-        zy = (df[y] - df[y].mean()) / (df[y].std(ddof=0) or 1)
-        return (zx.abs() > z) | (zy.abs() > z)
-
-def chart_count(data: pd.DataFrame, cat_col: str, title: str, force_bar: bool = True):
-    if data.empty:
-        st.warning("Tidak ada data untuk divisualisasikan.")
-        return
-    counts = data[cat_col].value_counts(dropna=False).reset_index()
-    counts.columns = ["Kategori", "Jumlah"]
-    if force_bar:
-        counts_wrapped = wrap_labels(counts, "Kategori", width=14)
-        fig = px.bar(counts_wrapped, x="Kategori", y="Jumlah", color="Kategori",
-                     title=title, text="Jumlah")
-        fig.update_traces(textposition="outside", cliponaxis=False)
-        fig.update_layout(xaxis_title="", yaxis_title="Jumlah", legend_title="")
-    else:
-        fig = px.pie(counts, names="Kategori", values="Jumlah", hole=0.35, title=title)
-        fig.update_traces(textposition="inside", textinfo="percent+label")
-        fig.update_layout(legend_title="")
-    fig.update_layout(modebar_add=["toImage"])
-    st.plotly_chart(fig, use_container_width=True)
-
-def scatter_cat_num(data: pd.DataFrame, cat_col: str, num_col: str, title: str, color_by: Optional[str] = None):
-    if data.empty:
-        st.warning("Tidak ada data untuk divisualisasikan.")
-        return
-    if (cat_col not in data.columns) or (num_col not in data.columns):
-        st.warning("Kolom tidak ditemukan di data terfilter.")
-        return
-    d = data[[cat_col, num_col] + ([color_by] if color_by else [])].dropna()
-    if d.empty:
-        st.info("Semua nilai kosong setelah filter. Coba ubah filter atau kolom.")
-        return
-    fig = px.scatter(d, x=cat_col, y=num_col, color=color_by,
-                     hover_data=d.columns, title=title, opacity=0.75)
-    fig.update_layout(xaxis_title=cat_col, yaxis_title=num_col, legend_title="", modebar_add=["toImage"])
-    st.plotly_chart(fig, use_container_width=True)
-
 # =========================
-# Statsmodels availability (untuk trendline OLS/LOWESS)
-# =========================
-try:
-    import statsmodels.api as _sm  # noqa: F401
-    HAS_STATSMODELS = True
-except Exception:
-    HAS_STATSMODELS = False
-
-# =========================
-# Sidebar nav (tanpa sumber data)
+# Sidebar nav & data source
 # =========================
 with st.sidebar:
     st.title("🧭 Navigasi")
@@ -258,40 +202,51 @@ with st.sidebar:
         ],
         index=0
     )
-    st.caption("Dataset dimuat otomatis dari CSV (tanpa upload).")
     st.markdown("---")
-    if st.button("↻ Refresh data"):
-        st.cache_data.clear()
-        st.rerun()
+    st.subheader("📁 Sumber Data")
+    data_mode = st.radio("Mode input", ["Upload CSV", "Paste CSV", "Input Manual (Editor)"], index=0)
+
+    uploaded = None
+    pasted_text = None
+    if data_mode == "Upload CSV":
+        uploaded = st.file_uploader("Unggah CSV", type=["csv"])
+    elif data_mode == "Paste CSV":
+        example = "Fakultas_norm,program studi_clean,biaya_internet_clean,Lama_Penggunaan_Jam,IPK\nFISIP,Ilmu Komunikasi,150000,2.0,3.2\nFH,Ilmu Hukum,200000,1.5,3.5\nFASILKOM,Sains Data,250000,2.5,3.7"
+        pasted_text = st.text_area("Tempel CSV di sini", value=example, height=160)
+        parse = st.button("Parse")
+        st.markdown("---")
+    st.caption("Gunakan halaman **Data** untuk unduh dataset hasil filter.")
+
+if "manual_df" not in st.session_state:
+    st.session_state.manual_df = pd.DataFrame({"Fakultas_norm": [], "program studi_clean": []})
 
 # =========================
-# Load data (langsung CSV lokal)
+# Load data
 # =========================
-DATA_SRC = "data_cleaned_ver2(1).csv"  # ganti dengan nama file CSV-mu bila berbeda
-
-BASE_DIR = Path(__file__).resolve().parent
-CSV_PATH = BASE_DIR / DATA_SRC
-
-@st.cache_data(show_spinner=False)
-def load_csv(path: Path) -> pd.DataFrame:
+df = None
+if data_mode == "Upload CSV" and uploaded is not None:
+    df = pd.read_csv(uploaded)
+elif data_mode == "Paste CSV" and pasted_text and 'parse' in locals() and parse:
     try:
-        return pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
-    except Exception:
-        return pd.read_csv(path, sep=None, engine="python", encoding="latin-1")
-
-try:
-    df = load_csv(CSV_PATH)
-except FileNotFoundError:
-    st.error(f"File tidak ditemukan: {CSV_PATH}\nWorking dir sekarang: {os.getcwd()}")
-    csvs = [p.name for p in BASE_DIR.glob("*.csv")]
-    st.info(f"CSV terdeteksi di folder app: {csvs}")
-    st.stop()
-except Exception as e:
-    st.error(f"Gagal membaca CSV: {e}")
-    st.stop()
+        df = read_csv_textarea(pasted_text)
+        st.sidebar.success("CSV berhasil dibaca.")
+    except Exception as e:
+        st.sidebar.error(f"Gagal parse CSV: {e}")
+elif data_mode == "Input Manual (Editor)":
+    st.markdown("### ✍️ Input Data Manual")
+    st.caption("Minimal butuh dua kolom: **Fakultas_norm** dan **program studi_clean** (boleh nama lain—app akan deteksi).")
+    edited = st.data_editor(
+        st.session_state.manual_df, num_rows="dynamic", use_container_width=True,
+        height=320, key="editor"
+    )
+    if st.button("Simpan Data Manual"):
+        st.session_state.manual_df = edited.copy()
+        st.success("Data manual disimpan.")
+    if not edited.empty:
+        df = edited.copy()
 
 if df is None or df.empty:
-    st.info("Dataset kosong. Pastikan DATA_SRC mengarah ke CSV yang benar dan berisi data.")
+    st.info("Belum ada data. Unggah / Paste CSV di sidebar, atau isi lewat editor manual.")
     st.stop()
 
 # =========================
@@ -359,6 +314,59 @@ num_cols = sorted([c for c in filtered.columns if pd.api.types.is_numeric_dtype(
 cat_cols = sorted([c for c in filtered.columns if (filtered[c].dtype == "object" or pd.api.types.is_categorical_dtype(filtered[c]))])
 
 # =========================
+# Common charts
+# =========================
+def chart_count(data: pd.DataFrame, cat_col: str, title: str, force_bar: bool = True):
+    if data.empty:
+        st.warning("Tidak ada data untuk divisualisasikan.")
+        return
+    counts = data[cat_col].value_counts(dropna=False).reset_index()
+    counts.columns = ["Kategori", "Jumlah"]
+    if force_bar:
+        counts_wrapped = wrap_labels(counts, "Kategori", width=14)
+        fig = px.bar(counts_wrapped, x="Kategori", y="Jumlah", color="Kategori",
+                     title=title, text="Jumlah")
+        fig.update_traces(textposition="outside", cliponaxis=False)
+        fig.update_layout(xaxis_title="", yaxis_title="Jumlah", legend_title="")
+    else:
+        fig = px.pie(counts, names="Kategori", values="Jumlah", hole=0.35, title=title)
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        fig.update_layout(legend_title="")
+    fig.update_layout(modebar_add=["toImage"])
+    st.plotly_chart(fig, use_container_width=True)
+
+def scatter_cat_num(data: pd.DataFrame, cat_col: str, num_col: str, title: str, color_by: Optional[str] = None):
+    if data.empty:
+        st.warning("Tidak ada data untuk divisualisasikan.")
+        return
+    if (cat_col not in data.columns) or (num_col not in data.columns):
+        st.warning("Kolom tidak ditemukan di data terfilter.")
+        return
+    d = data[[cat_col, num_col] + ([color_by] if color_by else [])].dropna()
+    if d.empty:
+        st.info("Semua nilai kosong setelah filter. Coba ubah filter atau kolom.")
+        return
+    fig = px.scatter(d, x=cat_col, y=num_col, color=color_by,
+                     hover_data=d.columns, title=title, opacity=0.75)
+    fig.update_layout(xaxis_title=cat_col, yaxis_title=num_col, legend_title="", modebar_add=["toImage"])
+    st.plotly_chart(fig, use_container_width=True)
+
+def flag_outliers(df_in, x, y, method="IQR", z=3.0):
+    df = df_in.copy()
+    if df.empty: return pd.Series(False, index=df.index)
+    if method.upper() == "IQR":
+        xq1, xq3 = np.percentile(df[x], [25, 75])
+        yq1, yq3 = np.percentile(df[y], [25, 75])
+        xi, yi = (xq3 - xq1), (yq3 - yq1)
+        xlow, xhigh = xq1 - 1.5 * xi, xq3 + 1.5 * xi
+        ylow, yhigh = yq1 - 1.5 * yi, yq3 + 1.5 * yi
+        return (df[x] < xlow) | (df[x] > xhigh) | (df[y] < ylow) | (df[y] > yhigh)
+    else:
+        zx = (df[x] - df[x].mean()) / (df[x].std(ddof=0) or 1)
+        zy = (df[y] - df[y].mean()) / (df[y].std(ddof=0) or 1)
+        return (zx.abs() > z) | (zy.abs() > z)
+
+# =========================
 # Pages
 # =========================
 if page == "📊 Beranda":
@@ -411,10 +419,12 @@ if page == "📊 Beranda":
         else:
             metric_card("Top Platform", "–", "#ef4444")
 
+    # ====== FIX: KPI Korelasi otomatis pilih pasangan terbaik ======
     with c6:
         st.caption("Korelasi Teknologi↔Hasil")
         OUTCOME_ALIASES = ["prestasi", "nilai", "IPK", "motivasi_belajar", "motivasi", "engagement"]
         out_col = find_col(filtered, OUTCOME_ALIASES)
+        # fallback: ambil kolom numerik lain selain kandidat X
         candidates = []
         if jam_col_use and jam_col_use in filtered:
             candidates.append(("Jam/Hari", jam_col_use))
@@ -446,6 +456,7 @@ if page == "📊 Beranda":
         if not shown:
             metric_card("Korelasi Teknologi↔Hasil", "Data tidak cukup", "#22c55e")
 
+    # ==== Visualisasi Utama (di atas Bubble) ====
     st.markdown("## Visualisasi Utama")
     v1, v2 = st.columns(2)
     with v1:
@@ -455,6 +466,7 @@ if page == "📊 Beranda":
         st.markdown("**Distribusi Program Studi**")
         chart_count(filtered, prodi_col, "Responden per Program Studi", force_bar=True)
 
+    # ===== 💸 KPI Ringkasan Biaya (di atas bubble) =====
     st.markdown("### 💸 KPI Ringkasan Biaya Internet")
     if biaya_col:
         agg_choice = st.radio("Agregasi KPI", ["Rata-rata (mean)", "Median"], horizontal=True, key="agg_home_radio")
@@ -477,6 +489,7 @@ if page == "📊 Beranda":
     else:
         st.info("Kolom biaya internet belum terdeteksi, KPI biaya tidak ditampilkan.")
 
+    # ===== 🧩 BUBBLE CHART: Klaster =====
     st.markdown("### 🧩 Klaster Rata-rata Harga Kuota (Bubble Chart)")
     if biaya_col:
         level = st.selectbox("Kelompok", ["Fakultas", "Program Studi"], index=0, key="cluster_level")
@@ -502,11 +515,14 @@ if page == "📊 Beranda":
                 km = KMeans(n_clusters=k, n_init=10, random_state=42)
                 agg_df["cluster"] = km.fit_predict(Xs)
             except Exception:
-                labels = list(range(k))
-                agg_df["cluster"] = pd.qcut(
-                    agg_df["avg_biaya"].rank(method="first"),
-                    q=k, labels=labels, duplicates="drop"
-                ).astype(int)
+                # SAFE fallback tanpa mismatch labels saat qcut melakukan 'duplicates=drop'
+                rank_vals = agg_df["avg_biaya"].rank(method="first")
+                q_eff = min(k, rank_vals.nunique())
+                if q_eff < 2:
+                    agg_df["cluster"] = 0
+                else:
+                    cuts = pd.qcut(rank_vals, q=q_eff, duplicates="drop")
+                    agg_df["cluster"] = pd.factorize(cuts)[0]  # 0..q_eff-1
 
             agg_df["label"] = agg_df["kelompok"]
 
@@ -539,6 +555,7 @@ if page == "📊 Beranda":
             st.markdown("#### 📝 Interpretasi Otomatis (Bubble)")
             st.write(interpret_bubble(agg_df, level, aggfunc2.title()))
 
+    # ===== Pengaruh Teknologi Ringkas =====
     st.markdown("### 🧠 Pengaruh Teknologi (Ringkas)")
     num_only = filtered.select_dtypes(include="number")
     if not num_only.empty and num_only.shape[1] >= 2:
@@ -560,14 +577,30 @@ if page == "📊 Beranda":
         d_imp = filtered[[x_expo, y_out] + ([color_by] if color_by else [])].dropna()
         if not d_imp.empty:
             lr = try_scipy_linregress(d_imp[x_expo], d_imp[y_out])
-            bins = pd.qcut(d_imp[x_expo], 4, labels=["Q1 (rendah)","Q2","Q3","Q4 (tinggi)"], duplicates="drop")
-            d_lift = d_imp.copy(); d_lift["quartile"] = bins
-            try:
-                q4 = d_lift.loc[d_lift["quartile"]=="Q4 (tinggi)", y_out].mean()
-                q1 = d_lift.loc[d_lift["quartile"]=="Q1 (rendah)", y_out].mean()
-                lift = q4 - q1
-            except Exception:
-                lift = np.nan
+
+            # ---------- SAFE QUARTILING (hindari ValueError labels vs edges) ----------
+            vals = pd.to_numeric(d_imp[x_expo], errors="coerce")
+            nuniq = vals.nunique(dropna=True)
+            labels_map = {
+                2: ["Q1 (rendah)", "Q2 (tinggi)"],
+                3: ["Q1 (rendah)", "Q2", "Q3 (tinggi)"],
+                4: ["Q1 (rendah)", "Q2", "Q3", "Q4 (tinggi)"],
+            }
+            q_eff = min(4, nuniq)  # kuartil efektif 2..4 sesuai variasi data
+
+            d_lift = d_imp.copy()
+            lift = np.nan
+            if q_eff >= 2:
+                bins = pd.qcut(vals.rank(method="first"), q=q_eff, labels=labels_map[q_eff], duplicates="drop")
+                d_lift["quartile"] = bins
+                low_label  = labels_map[q_eff][0]
+                high_label = labels_map[q_eff][-1]
+                q_high = d_lift.loc[d_lift["quartile"] == high_label, y_out].mean()
+                q_low  = d_lift.loc[d_lift["quartile"] == low_label,  y_out].mean()
+                lift = q_high - q_low
+            else:
+                d_lift["quartile"] = np.nan
+            # -------------------------------------------------------------------------
 
             k1,k2,k3,k4 = st.columns(4)
             with k1: st.metric("Slope (β₁)", safe_fmt(lr["slope"], "{:.3f}"))
@@ -577,31 +610,40 @@ if page == "📊 Beranda":
 
             L, R = st.columns(2)
             with L:
-                fig_sc = px.scatter(
-                    d_imp, x=x_expo, y=y_out, color=color_by, opacity=0.85,
-                    trendline=("ols" if HAS_STATSMODELS else None),
-                    title=f"{x_expo} → {y_out}"
-                )
-                if not HAS_STATSMODELS:
-                    fig_sc.update_layout(title=f"{x_expo} → {y_out} (tanpa trendline: statsmodels tidak tersedia)")
+                fig_sc = px.scatter(d_imp, x=x_expo, y=y_out, color=color_by, opacity=0.85,
+                                    trendline="ols", title=f"{x_expo} → {y_out}")
                 fig_sc.update_layout(legend_title="", modebar_add=["toImage"])
                 st.plotly_chart(fig_sc, use_container_width=True)
             with R:
                 nb = st.slider("Jumlah bin (rata-rata per bin X)", 5, 20, 10, key="bins_home")
-                d_bins = d_imp.copy(); d_bins["bin"] = pd.qcut(d_bins[x_expo], nb, duplicates="drop")
-                if d_bins["bin"].notna().sum() >= nb:
-                    agg = d_bins.groupby("bin").agg(x_mid=(x_expo,"mean"), y_mean=(y_out,"mean"), n=("bin","size")).reset_index()
-                    fig_bin = px.line(agg, x="x_mid", y="y_mean", markers=True, text="n",
-                                      title=f"Rata-rata {y_out} per bin {x_expo}")
-                    fig_bin.update_traces(textposition="top center")
-                    fig_bin.update_layout(modebar_add=["toImage"], xaxis_title=x_expo, yaxis_title=y_out)
-                    st.plotly_chart(fig_bin, use_container_width=True)
+
+                # ---------- Guard untuk BIN MEANS ----------
+                d_bins = d_imp.copy()
+                if d_bins[x_expo].nunique(dropna=True) < 2:
+                    st.info("Variabel X belum cukup bervariasi untuk dibagi menjadi beberapa bin.")
+                else:
+                    nb_eff = min(nb, d_bins[x_expo].nunique(dropna=True))
+                    d_bins["bin"] = pd.qcut(
+                        pd.to_numeric(d_bins[x_expo], errors="coerce").rank(method="first"),
+                        nb_eff,
+                        duplicates="drop"
+                    )
+                    if d_bins["bin"].notna().sum() >= nb_eff:
+                        agg = (d_bins.groupby("bin")
+                                     .agg(x_mid=(x_expo,"mean"), y_mean=(y_out,"mean"), n=("bin","size"))
+                                     .reset_index())
+                        fig_bin = px.line(agg, x="x_mid", y="y_mean", markers=True, text="n",
+                                          title=f"Rata-rata {y_out} per bin {x_expo}")
+                        fig_bin.update_traces(textposition="top center")
+                        fig_bin.update_layout(modebar_add=["toImage"], xaxis_title=x_expo, yaxis_title=y_out)
+                        st.plotly_chart(fig_bin, use_container_width=True)
+                # ------------------------------------------
 
             st.markdown("#### 📝 Interpretasi Otomatis")
             st.write(interpret_text(lr["pvalue"], lr["rvalue"], lr["slope"], lift, x_expo, y_out))
 
     st.markdown("### 🔥 Matriks Korelasi (Ringkas)")
-    if not num_only.empty and num_only.shape[1] >= 2:
+    if not num_only.empty and not num_only.corr(numeric_only=True).empty:
         fig = px.imshow(num_only.corr(numeric_only=True), text_auto=True, aspect="auto",
                         color_continuous_scale="RdBu_r", origin="lower", title="Matriks Korelasi")
         fig.update_layout(modebar_add=["toImage"])
@@ -623,12 +665,8 @@ elif page == "📈 Scatter":
             color_by2 = None if color_by2 == "(tanpa)" else color_by2
 
         with st.expander("Opsi lanjutan (opsional)", expanded=False):
-            trend_options = ["(none)", "ols", "lowess"] if HAS_STATSMODELS else ["(none)"]
-            trend_idx = (1 if HAS_STATSMODELS else 0)
-            trend = st.selectbox("Trendline", trend_options, index=trend_idx)
+            trend = st.selectbox("Trendline", ["(none)", "ols", "lowess"], index=1)
             trend = None if trend == "(none)" else trend
-            if not HAS_STATSMODELS:
-                st.caption("ℹ️ Trendline OLS/LOWESS nonaktif: paket `statsmodels` tidak tersedia.")
             outlier_method = st.selectbox("Highlight outlier dengan", ["(tanpa)", "IQR", "Z-score"], index=0)
 
         keep_cols = [x_num, y_num] + ([color_by2] if color_by2 else [])
@@ -724,6 +762,7 @@ elif page == "🧱 Komposisi Perangkat/Platform":
     st.markdown("---")
     st.subheader("🏆 Top Platform & Perangkat per Prodi (proporsi)")
 
+    # ----- Top Platform per Prodi -----
     if platform_col and platform_col in filtered.columns:
         dp = filtered[[prodi_col, platform_col]].dropna()
         if not dp.empty:
@@ -754,6 +793,7 @@ elif page == "🧱 Komposisi Perangkat/Platform":
         else:
             st.info("Tidak ada data platform setelah filter.")
 
+    # ----- Top Perangkat per Prodi -----
     if device_col and device_col in filtered.columns:
         dd = filtered[[prodi_col, device_col]].dropna()
         if not dd.empty:
@@ -816,4 +856,3 @@ elif page == "🗂️ Data":
     st.download_button("⬇️ Unduh Data (CSV)", data=csv, file_name="data_filtered.csv", mime="text/csv")
 
 # python -m streamlit run app.py
-
