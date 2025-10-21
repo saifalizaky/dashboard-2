@@ -5,6 +5,8 @@
 # ---------------------------------------------------------
 
 import io
+import os
+import glob
 import re
 import textwrap
 from typing import Optional, Tuple
@@ -184,6 +186,52 @@ def interpret_bubble(agg_df: pd.DataFrame, level: str, agg_name: str) -> str:
         f"({int(big_row['count'])} orang). Rentang ≈ **{fmt_money(rng)}**; CV ≈ **{safe_fmt(cv,'{:.2f}')}**."
     )
 
+# ======== AUTO-LOAD CSV from local folder (tanpa upload) ========
+DEFAULT_CSV_NAME = "data_cleaned_ver2(1).csv"
+
+def read_csv_robust(path: str) -> Optional[pd.DataFrame]:
+    for enc in [None, "utf-8", "utf-8-sig", "latin-1"]:
+        try:
+            return pd.read_csv(path, encoding=enc) if enc else pd.read_csv(path)
+        except Exception:
+            continue
+    return None
+
+def autoload_local_csv(preferred_name: str) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    candidates = []
+    # jika user mengisi path absolut/nama file
+    if preferred_name:
+        if os.path.isabs(preferred_name):
+            candidates.append(preferred_name)
+        # relatif
+        candidates += [
+            preferred_name,
+            os.path.join("data", preferred_name),
+            os.path.join("dataset", preferred_name),
+            os.path.join("datasets", preferred_name),
+            os.path.join(os.getcwd(), preferred_name),
+            os.path.join("/mnt/data", preferred_name),
+        ]
+    # explicit fallback yang sering dipakai
+    candidates.append("/mnt/data/data_cleaned_ver2(1).csv")
+    # cari secara rekursif berdasarkan nama file
+    try:
+        candidates += glob.glob(f"**/{preferred_name}", recursive=True)
+    except Exception:
+        pass
+
+    seen = set()
+    for p in candidates:
+        p2 = os.path.normpath(p)
+        if p2 in seen: 
+            continue
+        seen.add(p2)
+        if os.path.isfile(p2):
+            df = read_csv_robust(p2)
+            if df is not None:
+                return df, p2
+    return None, None
+
 # =========================
 # Sidebar nav & data source
 # =========================
@@ -204,10 +252,16 @@ with st.sidebar:
     )
     st.markdown("---")
     st.subheader("📁 Sumber Data")
-    data_mode = st.radio("Mode input", ["Upload CSV", "Paste CSV", "Input Manual (Editor)"], index=0)
+    data_mode = st.radio(
+        "Mode input",
+        ["Auto (CSV lokal)", "Upload CSV", "Paste CSV", "Input Manual (Editor)"],
+        index=0
+    )
 
     uploaded = None
     pasted_text = None
+    auto_name = DEFAULT_CSV_NAME
+    used_path_msg = ""
     if data_mode == "Upload CSV":
         uploaded = st.file_uploader("Unggah CSV", type=["csv"])
     elif data_mode == "Paste CSV":
@@ -215,6 +269,10 @@ with st.sidebar:
         pasted_text = st.text_area("Tempel CSV di sini", value=example, height=160)
         parse = st.button("Parse")
         st.markdown("---")
+    elif data_mode == "Auto (CSV lokal)":
+        auto_name = st.text_input("Nama/path CSV (otomatis)", value=DEFAULT_CSV_NAME,
+                                  help="Isi dengan nama file atau path relatif/absolut. App akan mencari otomatis di beberapa folder umum.")
+
     st.caption("Gunakan halaman **Data** untuk unduh dataset hasil filter.")
 
 if "manual_df" not in st.session_state:
@@ -224,7 +282,14 @@ if "manual_df" not in st.session_state:
 # Load data
 # =========================
 df = None
-if data_mode == "Upload CSV" and uploaded is not None:
+found_path = None
+if data_mode == "Auto (CSV lokal)":
+    df, found_path = autoload_local_csv(auto_name)
+    if df is not None:
+        st.sidebar.success(f"CSV terbaca otomatis: {found_path}")
+    else:
+        st.sidebar.error("Gagal membaca CSV secara otomatis. Periksa nama/path file, atau gunakan mode lain.")
+elif data_mode == "Upload CSV" and uploaded is not None:
     df = pd.read_csv(uploaded)
 elif data_mode == "Paste CSV" and pasted_text and 'parse' in locals() and parse:
     try:
@@ -246,7 +311,7 @@ elif data_mode == "Input Manual (Editor)":
         df = edited.copy()
 
 if df is None or df.empty:
-    st.info("Belum ada data. Unggah / Paste CSV di sidebar, atau isi lewat editor manual.")
+    st.info("Belum ada data. Aktifkan mode **Auto (CSV lokal)** dengan nama/path yang benar, atau gunakan Upload/Paste/Editor.")
     st.stop()
 
 # =========================
